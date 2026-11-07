@@ -22,6 +22,24 @@ export interface PiDurableConnection {
   workerToken: string;
   authorityMode: "read_only" | "propose_with_approval";
   enabledCollections: string[];
+  subscriptionAuth?: {
+    providerId: string;
+    authType: "oauth" | "api_key";
+    label: string;
+    connectedAt: string;
+  };
+}
+
+export interface PendingOAuthSession {
+  providerId: "openai-codex" | "anthropic" | "xai";
+  flow: "device_code" | "pkce_code";
+  userCode?: string;
+  verificationUri: string;
+  deviceAuthId?: string;
+  deviceCode?: string;
+  verifier?: string;
+  intervalSeconds: number;
+  createdAt: string;
 }
 
 export interface ActiveTurn {
@@ -152,12 +170,90 @@ async function loadConnection(ctx: PluginContext): Promise<PiDurableConnection |
         enabledCollections: Array.isArray(parsed.enabledCollections)
           ? parsed.enabledCollections.filter((item): item is string => typeof item === "string")
           : ["pages", "posts"],
+        ...(parsed.subscriptionAuth && typeof parsed.subscriptionAuth === "object"
+          ? { subscriptionAuth: parsed.subscriptionAuth }
+          : {}),
       };
     }
   } catch {
     // Malformed settings require re-setup.
   }
   return null;
+}
+
+async function saveConnectionRecord(
+  ctx: PluginContext,
+  connection: PiDurableConnection,
+): Promise<void> {
+  const existing = await ctx.settings.getVersioned("connection");
+  await ctx.settings.compareAndSet(
+    "connection",
+    existing?.revision ?? null,
+    JSON.stringify(connection),
+  );
+}
+
+async function loadPendingOAuth(ctx: PluginContext): Promise<PendingOAuthSession | null> {
+  if (!ctx.kv) return null;
+  const raw = await ctx.kv.get("pending_oauth");
+  if (!raw || typeof raw !== "object") return null;
+  return raw as PendingOAuthSession;
+}
+
+const OPENAI_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
+const ANTHROPIC_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+const XAI_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828";
+
+function base64urlEncode(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
+}
+
+async function generatePKCE(): Promise<{ verifier: string; challenge: string }> {
+  const verifierBytes = new Uint8Array(32);
+  crypto.getRandomValues(verifierBytes);
+  const verifier = base64urlEncode(verifierBytes);
+  const data = new TextEncoder().encode(verifier);
+  const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+  const challenge = base64urlEncode(new Uint8Array(hashBuffer));
+  return { verifier, challenge };
+}
+
+async function pluginFetch(
+  ctx: PluginContext,
+  url: string,
+  init: RequestInit,
+): Promise<Response> {
+  if (ctx.http?.fetch) {
+    return ctx.http.fetch(url, init);
+  }
+  return fetch(url, init);
+}
+
+async function syncCredentialToWorker(
+  ctx: PluginContext,
+  connection: PiDurableConnection,
+  providerId: string,
+  authType: "oauth" | "api_key",
+  credential: unknown,
+): Promise<void> {
+  try {
+    const headers: Record<string, string> = { "content-type": "application/json" };
+    if (connection.workerToken && connection.workerToken !== "default") {
+      headers.authorization = `Bearer ${connection.workerToken}`;
+    }
+    const baseUrl = connection.workerUrl.replace(/\/+$/, "");
+    await pluginFetch(ctx, `${baseUrl}/auth/store`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ providerId, authType, credential }),
+    });
+  } catch {
+    // Best-effort sync to Worker DO; encrypted settings remain authoritative.
+  }
 }
 
 async function loadProposals(ctx: PluginContext): Promise<PendingProposal[]> {
@@ -333,6 +429,8 @@ export function workspacePage(
   isAdmin: boolean,
   replyText?: string,
   toast?: BlockResponse["toast"],
+  pendingOAuth?: PendingOAuthSession | null,
+  defaultTab?: number,
 ): BlockResponse {
   const modelLabel = SUPPORTED_PI_MODELS[connection.model] ?? connection.model;
   let workerHost = connection.workerUrl;
@@ -342,21 +440,25 @@ export function workspacePage(
     // Keep full string if URL parsing fails.
   }
 
+  const subAuth = connection.subscriptionAuth;
   const blocks: Block[] = [
     header("Pi Assistant"),
     {
       type: "stats",
       items: [
         {
-          label: "Pi Subscription Model",
-          value: modelLabel.split("—")[1]?.trim() ?? modelLabel,
-          description: modelLabel.split("—")[0]?.trim() ?? connection.model,
-          trend: "up",
+          label: "Subscription Auth",
+          value: subAuth ? `Connected (${subAuth.label})` : "Not Signed In",
+          description: subAuth
+            ? `Verified via ${subAuth.authType === "oauth" ? "Pi OAuth" : "API Key"}`
+            : "Open 'Subscription & OAuth' tab to sign in",
+          trend: subAuth ? "up" : "down",
         },
         {
-          label: "Durable Object Worker",
-          value: workerHost,
-          description: activeTurn ? `Active task (${activeTurn.status})` : "Idle & ready",
+          label: "Pi Subscription Model",
+          value: modelLabel.split("—")[1]?.trim() ?? modelLabel,
+          description: `${modelLabel.split("—")[0]?.trim() ?? connection.model} · ${workerHost}`,
+          trend: "up",
         },
         {
           label: "Approval Queue",
@@ -368,6 +470,16 @@ export function workspacePage(
       ],
     },
   ];
+
+  if (!subAuth) {
+    blocks.push(
+      banner(
+        "alert",
+        "Worker connected — sign in to your Pi subscription next",
+        "Your Cloudflare Worker is connected, but your model subscription is not authenticated yet. Use the 'Subscription & OAuth' tab below to sign in with OpenAI ChatGPT/Codex, Anthropic Claude Pro/Max, or xAI Grok.",
+      ),
+    );
+  }
 
   const assistantLeft: Block[] = [
     {
@@ -479,6 +591,154 @@ export function workspacePage(
           { type: "divider" as const },
         ]);
 
+  const oauthLeftBlocks: Block[] = [];
+  if (subAuth) {
+    oauthLeftBlocks.push(
+      banner(
+        "default",
+        `Subscription Verified — ${subAuth.label}`,
+        `Connected via ${subAuth.authType === "oauth" ? "Pi OAuth" : "API Key"} (${subAuth.connectedAt}). Your Pi Durable Worker can now execute turns using ${modelLabel}.`,
+      ),
+    );
+  }
+  if (pendingOAuth) {
+    if (pendingOAuth.flow === "device_code" && pendingOAuth.userCode) {
+      oauthLeftBlocks.push({
+        type: "empty",
+        size: "sm",
+        title: `1. Copy Code & Authorize (${pendingOAuth.providerId})`,
+        description:
+          "Copy the device code below with the copy icon, click 'Open Sign-In Page' to approve in your browser, then click 'Complete OAuth Sign-In'.",
+        command_line: pendingOAuth.userCode,
+        actions: [
+          {
+            type: "link",
+            label: "Open Sign-In Page",
+            target: { kind: "external", url: pendingOAuth.verificationUri },
+            appearance: "primary",
+          },
+          {
+            type: "button",
+            label: "Complete OAuth Sign-In",
+            action_id: "poll_oauth_device",
+            style: "primary",
+          },
+          {
+            type: "button",
+            label: "Cancel",
+            action_id: "cancel_oauth",
+            style: "secondary",
+          },
+        ],
+      });
+    } else if (pendingOAuth.flow === "pkce_code") {
+      oauthLeftBlocks.push(
+        {
+          type: "empty",
+          size: "sm",
+          title: "1. Authorize Anthropic (Claude Pro / Max)",
+          description:
+            "Click below to sign in with your Claude Pro/Max subscription, then paste the 'code#state' string Anthropic displays into the box below.",
+          actions: [
+            {
+              type: "link",
+              label: "Open Claude OAuth Sign-In",
+              target: { kind: "external", url: pendingOAuth.verificationUri },
+              appearance: "primary",
+            },
+            {
+              type: "button",
+              label: "Cancel",
+              action_id: "cancel_oauth",
+              style: "secondary",
+            },
+          ],
+        },
+        {
+          type: "form",
+          block_id: "pi-anthropic-code-form",
+          fields: [
+            {
+              type: "text_input",
+              action_id: "authorizationCode",
+              label: "Paste Anthropic Authorization Code (code#state)",
+              placeholder: "code#state",
+            },
+          ],
+          submit: { label: "Complete Claude OAuth", action_id: "complete_anthropic_oauth" },
+        },
+      );
+    }
+  } else {
+    oauthLeftBlocks.push(
+      header("Option 1 — 1-Click Pi Subscription OAuth"),
+      context(
+        "Authenticate your existing AI subscription directly from EmDash using @earendil-works/pi-ai OAuth (no separate API billing needed).",
+      ),
+      {
+        type: "actions",
+        elements: [
+          {
+            type: "button",
+            label: "Sign in with OpenAI (ChatGPT Plus/Pro)",
+            action_id: "start_oauth_openai",
+            style: "primary",
+          },
+          {
+            type: "button",
+            label: "Sign in with Claude Pro/Max",
+            action_id: "start_oauth_anthropic",
+            style: "secondary",
+          },
+          {
+            type: "button",
+            label: "Sign in with xAI (SuperGrok)",
+            action_id: "start_oauth_xai",
+            style: "secondary",
+          },
+        ],
+      },
+    );
+  }
+
+  const oauthRightBlocks: Block[] = [
+    header("Option 2 — Paste API Key or Token Directly"),
+    context(
+      "Prefer a direct API key (OpenAI, Anthropic, Gemini, xAI) or a token from ~/.pi/agent/auth.json? Save it directly to your Worker here.",
+    ),
+    {
+      type: "form",
+      block_id: "pi-direct-auth-form",
+      fields: [
+        {
+          type: "select",
+          action_id: "providerId",
+          label: "Provider",
+          initial_value: connection.model.split("/")[0] ?? "openai-codex",
+          options: [
+            { label: "OpenAI / Codex", value: "openai-codex" },
+            { label: "Anthropic Claude", value: "anthropic" },
+            { label: "Google Gemini", value: "google" },
+            { label: "xAI Grok", value: "xai" },
+            { label: "Meta Muse", value: "meta" },
+          ],
+        },
+        {
+          type: "secret_input",
+          action_id: "apiKey",
+          label: "Provider API Key or OAuth Access Token",
+          placeholder: "sk-... or OAuth token",
+          has_value: Boolean(subAuth),
+        },
+      ],
+      submit: { label: "Save Subscription Key", action_id: "save_subscription_key" },
+    },
+  ];
+
+  const subscriptionBlocks: Block[] = isAdmin
+    ? [{ type: "columns", columns: [oauthLeftBlocks, oauthRightBlocks] }]
+    : [context("Only an Administrator can authenticate the Pi subscription.")];
+
   const settingsBlocks: Block[] = isAdmin
     ? [
         {
@@ -507,6 +767,10 @@ export function workspacePage(
               fields(
                 ["Worker Endpoint", connection.workerUrl],
                 [
+                  "Subscription Status",
+                  subAuth ? `Signed in (${subAuth.label})` : "Not signed in yet",
+                ],
+                [
                   "Authority Mode",
                   connection.authorityMode === "read_only"
                     ? "Read-only"
@@ -532,10 +796,15 @@ export function workspacePage(
 
   blocks.push({
     type: "tab",
+    ...(typeof defaultTab === "number" ? { default_tab: defaultTab } : {}),
     panels: [
       {
         label: "Assistant & Live Steer",
         blocks: [{ type: "columns", columns: [assistantLeft, assistantRight] }],
+      },
+      {
+        label: subAuth ? `Subscription & OAuth (✓)` : "Subscription & OAuth (Sign In)",
+        blocks: subscriptionBlocks,
       },
       {
         label: `Approval Queue (${proposals.length})`,
@@ -649,6 +918,496 @@ export async function piDurableAdmin(
 
   const proposals = await loadProposals(ctx);
   let activeTurn = await loadActiveTurn(ctx);
+  const pendingOAuth = await loadPendingOAuth(ctx);
+
+  if (event.type === "block_action" && event.action_id === "cancel_oauth" && isAdmin) {
+    if (ctx.kv) {
+      await ctx.kv.delete("pending_oauth");
+    }
+    return workspacePage(
+      connection,
+      collections,
+      proposals,
+      activeTurn,
+      isAdmin,
+      undefined,
+      { type: "info", message: "Cancelled pending OAuth sign-in." },
+      null,
+      1,
+    );
+  }
+
+  if (event.type === "block_action" && event.action_id === "start_oauth_openai" && isAdmin) {
+    try {
+      const resp = await pluginFetch(ctx, "https://auth.openai.com/api/accounts/deviceauth/usercode", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ client_id: OPENAI_CLIENT_ID }),
+      });
+      const json = (await resp.json()) as {
+        device_auth_id?: string;
+        user_code?: string;
+        interval?: number | string;
+      };
+      if (!resp.ok || !json.device_auth_id || !json.user_code) {
+        throw new Error(`OpenAI device code request returned HTTP ${resp.status}`);
+      }
+      const nextOAuth: PendingOAuthSession = {
+        providerId: "openai-codex",
+        flow: "device_code",
+        userCode: json.user_code,
+        verificationUri: "https://auth.openai.com/codex/device",
+        deviceAuthId: json.device_auth_id,
+        intervalSeconds: Number(json.interval) || 5,
+        createdAt: new Date().toISOString(),
+      };
+      if (ctx.kv) {
+        await ctx.kv.set("pending_oauth", nextOAuth);
+      }
+      return workspacePage(
+        connection,
+        collections,
+        proposals,
+        activeTurn,
+        isAdmin,
+        undefined,
+        {
+          type: "info",
+          message: `OpenAI device code ready (${json.user_code}). Copy the code and authorize in your browser.`,
+        },
+        nextOAuth,
+        1,
+      );
+    } catch (err) {
+      return workspacePage(
+        connection,
+        collections,
+        proposals,
+        activeTurn,
+        isAdmin,
+        undefined,
+        {
+          type: "error",
+          message: `Could not start OpenAI device code flow: ${err instanceof Error ? err.message : String(err)}`,
+        },
+        pendingOAuth,
+        1,
+      );
+    }
+  }
+
+  if (event.type === "block_action" && event.action_id === "start_oauth_xai" && isAdmin) {
+    try {
+      const resp = await pluginFetch(ctx, "https://auth.x.ai/oauth2/device/code", {
+        method: "POST",
+        headers: {
+          accept: "application/json",
+          "content-type": "application/x-www-form-urlencoded",
+        },
+        body: new URLSearchParams({
+          client_id: XAI_CLIENT_ID,
+          scope: "openid profile email offline_access grok-cli:access api:access",
+          referrer: "pi",
+        }).toString(),
+      });
+      const json = (await resp.json()) as {
+        device_code?: string;
+        user_code?: string;
+        verification_uri?: string;
+        verification_uri_complete?: string;
+        interval?: number;
+      };
+      if (!resp.ok || !json.device_code || !json.user_code) {
+        throw new Error(`xAI device code request returned HTTP ${resp.status}`);
+      }
+      const nextOAuth: PendingOAuthSession = {
+        providerId: "xai",
+        flow: "device_code",
+        userCode: json.user_code,
+        verificationUri: json.verification_uri_complete ?? json.verification_uri ?? "https://auth.x.ai",
+        deviceCode: json.device_code,
+        intervalSeconds: json.interval ?? 5,
+        createdAt: new Date().toISOString(),
+      };
+      if (ctx.kv) {
+        await ctx.kv.set("pending_oauth", nextOAuth);
+      }
+      return workspacePage(
+        connection,
+        collections,
+        proposals,
+        activeTurn,
+        isAdmin,
+        undefined,
+        {
+          type: "info",
+          message: `xAI SuperGrok code ready (${json.user_code}). Copy the code and authorize in your browser.`,
+        },
+        nextOAuth,
+        1,
+      );
+    } catch (err) {
+      return workspacePage(
+        connection,
+        collections,
+        proposals,
+        activeTurn,
+        isAdmin,
+        undefined,
+        {
+          type: "error",
+          message: `Could not start xAI device flow: ${err instanceof Error ? err.message : String(err)}`,
+        },
+        pendingOAuth,
+        1,
+      );
+    }
+  }
+
+  if (event.type === "block_action" && event.action_id === "start_oauth_anthropic" && isAdmin) {
+    const { verifier, challenge } = await generatePKCE();
+    const authParams = new URLSearchParams({
+      code: "true",
+      client_id: ANTHROPIC_CLIENT_ID,
+      response_type: "code",
+      redirect_uri: "https://platform.claude.com/oauth/code/callback",
+      scope:
+        "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload",
+      code_challenge: challenge,
+      code_challenge_method: "S256",
+      state: verifier,
+    });
+    const nextOAuth: PendingOAuthSession = {
+      providerId: "anthropic",
+      flow: "pkce_code",
+      verificationUri: `https://claude.ai/oauth/authorize?${authParams.toString()}`,
+      verifier,
+      intervalSeconds: 0,
+      createdAt: new Date().toISOString(),
+    };
+    if (ctx.kv) {
+      await ctx.kv.set("pending_oauth", nextOAuth);
+    }
+    return workspacePage(
+      connection,
+      collections,
+      proposals,
+      activeTurn,
+      isAdmin,
+      undefined,
+      {
+        type: "info",
+        message: "Click 'Open Claude OAuth Sign-In', then paste the code#state shown by Anthropic.",
+      },
+      nextOAuth,
+      1,
+    );
+  }
+
+  if (event.type === "block_action" && event.action_id === "poll_oauth_device" && isAdmin) {
+    if (!pendingOAuth) {
+      return workspacePage(
+        connection,
+        collections,
+        proposals,
+        activeTurn,
+        isAdmin,
+        undefined,
+        { type: "error", message: "No active OAuth device session found." },
+        null,
+        1,
+      );
+    }
+    if (pendingOAuth.providerId === "openai-codex") {
+      const pollResp = await pluginFetch(ctx, "https://auth.openai.com/api/accounts/deviceauth/token", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          device_auth_id: pendingOAuth.deviceAuthId,
+          user_code: pendingOAuth.userCode,
+        }),
+      });
+      if (!pollResp.ok) {
+        return workspacePage(
+          connection,
+          collections,
+          proposals,
+          activeTurn,
+          isAdmin,
+          undefined,
+          {
+            type: "info",
+            message:
+              "Still waiting for browser approval on auth.openai.com/codex/device — approve in your browser, then click 'Complete OAuth Sign-In' again.",
+          },
+          pendingOAuth,
+          1,
+        );
+      }
+      const pollJson = (await pollResp.json()) as {
+        authorization_code?: string;
+        code_verifier?: string;
+      };
+      const tokenResp = await pluginFetch(ctx, "https://auth.openai.com/oauth/token", {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          client_id: OPENAI_CLIENT_ID,
+          code: pollJson.authorization_code ?? "",
+          code_verifier: pollJson.code_verifier ?? "",
+          redirect_uri: "https://auth.openai.com/deviceauth/callback",
+        }).toString(),
+      });
+      if (!tokenResp.ok) {
+        return workspacePage(
+          connection,
+          collections,
+          proposals,
+          activeTurn,
+          isAdmin,
+          undefined,
+          { type: "error", message: `OpenAI token exchange failed (${tokenResp.status}).` },
+          pendingOAuth,
+          1,
+        );
+      }
+      const tokenData = (await tokenResp.json()) as {
+        access_token?: string;
+        refresh_token?: string;
+        expires_in?: number;
+      };
+      const credential = {
+        type: "oauth",
+        access: tokenData.access_token ?? "",
+        refresh: tokenData.refresh_token ?? "",
+        expires: Date.now() + (tokenData.expires_in ?? 3600) * 1000,
+      };
+      const updated: PiDurableConnection = {
+        ...connection,
+        subscriptionAuth: {
+          providerId: "openai-codex",
+          authType: "oauth",
+          label: "OpenAI (ChatGPT Plus/Pro)",
+          connectedAt: new Date().toISOString().slice(0, 10),
+        },
+      };
+      await saveConnectionRecord(ctx, updated);
+      await syncCredentialToWorker(ctx, updated, "openai-codex", "oauth", credential);
+      if (ctx.kv) await ctx.kv.delete("pending_oauth");
+      return workspacePage(
+        updated,
+        collections,
+        proposals,
+        activeTurn,
+        isAdmin,
+        undefined,
+        {
+          type: "success",
+          message: "Signed in with OpenAI (ChatGPT Plus/Pro) and synced OAuth credentials to your Worker!",
+        },
+        null,
+        1,
+      );
+    }
+
+    if (pendingOAuth.providerId === "xai") {
+      const tokenResp = await pluginFetch(ctx, "https://auth.x.ai/oauth2/token", {
+        method: "POST",
+        headers: {
+          accept: "application/json",
+          "content-type": "application/x-www-form-urlencoded",
+        },
+        body: new URLSearchParams({
+          grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+          client_id: XAI_CLIENT_ID,
+          device_code: pendingOAuth.deviceCode ?? "",
+        }).toString(),
+      });
+      if (!tokenResp.ok) {
+        return workspacePage(
+          connection,
+          collections,
+          proposals,
+          activeTurn,
+          isAdmin,
+          undefined,
+          {
+            type: "info",
+            message:
+              "Still waiting for xAI browser approval — complete sign-in in your browser, then click 'Complete OAuth Sign-In' again.",
+          },
+          pendingOAuth,
+          1,
+        );
+      }
+      const tokenData = (await tokenResp.json()) as {
+        access_token?: string;
+        refresh_token?: string;
+        expires_in?: number;
+      };
+      const credential = {
+        type: "oauth",
+        access: tokenData.access_token ?? "",
+        refresh: tokenData.refresh_token ?? "",
+        expires: Date.now() + (tokenData.expires_in ?? 3600) * 1000,
+      };
+      const updated: PiDurableConnection = {
+        ...connection,
+        subscriptionAuth: {
+          providerId: "xai",
+          authType: "oauth",
+          label: "xAI (SuperGrok / X Premium)",
+          connectedAt: new Date().toISOString().slice(0, 10),
+        },
+      };
+      await saveConnectionRecord(ctx, updated);
+      await syncCredentialToWorker(ctx, updated, "xai", "oauth", credential);
+      if (ctx.kv) await ctx.kv.delete("pending_oauth");
+      return workspacePage(
+        updated,
+        collections,
+        proposals,
+        activeTurn,
+        isAdmin,
+        undefined,
+        {
+          type: "success",
+          message: "Signed in with xAI (SuperGrok) and synced OAuth credentials to your Worker!",
+        },
+        null,
+        1,
+      );
+    }
+  }
+
+  if (event.type === "form_submit" && event.action_id === "complete_anthropic_oauth" && isAdmin) {
+    const rawCode = cleanText(event.values.authorizationCode, 600);
+    if (!rawCode || !pendingOAuth || pendingOAuth.providerId !== "anthropic") {
+      return workspacePage(
+        connection,
+        collections,
+        proposals,
+        activeTurn,
+        isAdmin,
+        undefined,
+        { type: "error", message: "Paste the code#state string shown by Anthropic." },
+        pendingOAuth,
+        1,
+      );
+    }
+    const [code, state] = rawCode.includes("#")
+      ? rawCode.split("#", 2)
+      : [rawCode, pendingOAuth.verifier ?? ""];
+    const tokenResp = await pluginFetch(ctx, "https://platform.claude.com/v1/oauth/token", {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json" },
+      body: JSON.stringify({
+        grant_type: "authorization_code",
+        client_id: ANTHROPIC_CLIENT_ID,
+        code,
+        state: state || pendingOAuth.verifier,
+        redirect_uri: "https://platform.claude.com/oauth/code/callback",
+        code_verifier: pendingOAuth.verifier,
+      }),
+    });
+    if (!tokenResp.ok) {
+      return workspacePage(
+        connection,
+        collections,
+        proposals,
+        activeTurn,
+        isAdmin,
+        undefined,
+        { type: "error", message: `Anthropic token exchange failed (HTTP ${tokenResp.status}).` },
+        pendingOAuth,
+        1,
+      );
+    }
+    const tokenData = (await tokenResp.json()) as {
+      access_token?: string;
+      refresh_token?: string;
+      expires_in?: number;
+    };
+    const credential = {
+      type: "oauth",
+      access: tokenData.access_token ?? "",
+      refresh: tokenData.refresh_token ?? "",
+      expires: Date.now() + (tokenData.expires_in ?? 3600) * 1000,
+    };
+    const updated: PiDurableConnection = {
+      ...connection,
+      subscriptionAuth: {
+        providerId: "anthropic",
+        authType: "oauth",
+        label: "Anthropic (Claude Pro/Max)",
+        connectedAt: new Date().toISOString().slice(0, 10),
+      },
+    };
+    await saveConnectionRecord(ctx, updated);
+    await syncCredentialToWorker(ctx, updated, "anthropic", "oauth", credential);
+    if (ctx.kv) await ctx.kv.delete("pending_oauth");
+    return workspacePage(
+      updated,
+      collections,
+      proposals,
+      activeTurn,
+      isAdmin,
+      undefined,
+      {
+        type: "success",
+        message: "Signed in with Anthropic (Claude Pro/Max) and synced OAuth credentials to your Worker!",
+      },
+      null,
+      1,
+    );
+  }
+
+  if (event.type === "form_submit" && event.action_id === "save_subscription_key" && isAdmin) {
+    const providerId = cleanText(event.values.providerId, 60) ?? "openai-codex";
+    const apiKey = cleanText(event.values.apiKey, 600);
+    if (!apiKey) {
+      return workspacePage(
+        connection,
+        collections,
+        proposals,
+        activeTurn,
+        isAdmin,
+        undefined,
+        { type: "error", message: "Enter your provider API key or OAuth token." },
+        pendingOAuth,
+        1,
+      );
+    }
+    const updated: PiDurableConnection = {
+      ...connection,
+      subscriptionAuth: {
+        providerId,
+        authType: "api_key",
+        label: providerId,
+        connectedAt: new Date().toISOString().slice(0, 10),
+      },
+    };
+    await saveConnectionRecord(ctx, updated);
+    await syncCredentialToWorker(ctx, updated, providerId, "api_key", {
+      type: "api_key",
+      key: apiKey,
+    });
+    return workspacePage(
+      updated,
+      collections,
+      proposals,
+      activeTurn,
+      isAdmin,
+      undefined,
+      {
+        type: "success",
+        message: `Saved ${providerId} credential and synced to your Pi Durable Worker.`,
+      },
+      null,
+      1,
+    );
+  }
 
   if (event.type === "form_submit" && event.action_id === "save_collections" && isAdmin) {
     const enabledCollections = Array.isArray(event.values.enabledCollections)
@@ -756,7 +1515,17 @@ export async function piDurableAdmin(
     );
   }
 
-  return workspacePage(connection, collections, proposals, activeTurn, isAdmin);
+  return workspacePage(
+    connection,
+    collections,
+    proposals,
+    activeTurn,
+    isAdmin,
+    undefined,
+    undefined,
+    pendingOAuth,
+    pendingOAuth ? 1 : undefined,
+  );
 }
 
 /**

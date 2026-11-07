@@ -157,3 +157,33 @@ test("supports live mid-task steer and configurable editor side-panel collaborat
   assert.doesNotThrow(() => validateBlockResponse(pagesPanel));
   assert.equal(pagesPanel.blocks.some(b => b.type === "form" && b.block_id === "pi-durable-entry-form"), true);
 });
+
+test("supports Subscription & OAuth sign-in and credential sync from the admin panel", async () => {
+  const { ctx, route } = createHost({
+    role: 50,
+    initialConnection: {
+      workerUrl: "https://pi-durable-assistant.example.workers.dev",
+      model: "openai-codex/gpt-6.1-sol:high",
+      workerToken: "default",
+      authorityMode: "propose_with_approval",
+      enabledCollections: ["pages"],
+    },
+  });
+
+  const savedKey = await admin(
+    route({
+      type: "form_submit",
+      action_id: "save_subscription_key",
+      values: {
+        providerId: "openai-codex",
+        apiKey: "sk-test-subscription-token",
+      },
+    }),
+    ctx,
+  );
+  assert.doesNotThrow(() => validateBlockResponse(savedKey));
+  assert.equal(savedKey.toast?.type, "success");
+  const statsBlock = savedKey.blocks.find(b => b.type === "stats");
+  assert.ok(statsBlock);
+  assert.match(String(statsBlock.items[0].value), /Connected/);
+});

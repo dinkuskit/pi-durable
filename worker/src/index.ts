@@ -23,12 +23,45 @@ export class EmDashPiDurableAgent {
         status TEXT NOT NULL,
         steer_note TEXT,
         created_at TEXT NOT NULL
-      )
+      );
+      CREATE TABLE IF NOT EXISTS subscription_auth (
+        provider_id TEXT PRIMARY KEY,
+        auth_type TEXT NOT NULL,
+        credential_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
     `);
   }
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
+    if (request.method === "GET" && url.pathname === "/auth/status") {
+      const rows = this.ctx.storage.sql
+        .exec(`SELECT provider_id, auth_type, updated_at FROM subscription_auth ORDER BY updated_at DESC`)
+        .toArray();
+      return Response.json({
+        ok: true,
+        authenticated: rows.length > 0,
+        providers: rows,
+      });
+    }
+    if (request.method === "POST" && url.pathname === "/auth/store") {
+      const body = (await request.json()) as {
+        providerId?: string;
+        authType?: string;
+        credential?: unknown;
+      };
+      const providerId = body.providerId ?? "openai-codex";
+      const authType = body.authType ?? "oauth";
+      this.ctx.storage.sql.exec(
+        `INSERT OR REPLACE INTO subscription_auth (provider_id, auth_type, credential_json, updated_at) VALUES (?, ?, ?, ?)`,
+        providerId,
+        authType,
+        JSON.stringify(body.credential ?? {}),
+        new Date().toISOString(),
+      );
+      return Response.json({ ok: true, providerId, authType });
+    }
     if (request.method === "POST" && url.pathname === "/turn") {
       const body = (await request.json()) as {
         turnId?: string;
