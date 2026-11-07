@@ -211,13 +211,13 @@ export function setupPage(
       ],
     },
     fields(
-      ["Repository Visibility", "Private Git repository (default)"],
-      ["Protect with Cloudflare Access", "Leave OFF (EmDash authenticates server-to-server via Bearer token)"],
-      ["Root Directory & API Token", "Leave as '/' and 'Create new token' (defaults)"],
-      ["Optional Environment Variable", "Add PI_WORKER_TOKEN under Environment Variables to require a custom secret"],
+      ["1. Deploy Defaults", "Private Git repo (ON), Protect with Cloudflare Access (OFF), Root '/'"],
+      ["2. Enable Worker URL", "In Cloudflare Worker → Domains, toggle 'Production *.workers.dev' ON"],
+      ["3. Copy Worker URL", "Copy https://dinkus-pi-durable-worker.<your-subdomain>.workers.dev and paste below"],
+      ["4. Optional Token", "Leave token blank unless you added PI_WORKER_TOKEN in Cloudflare Environment Variables"],
     ),
     context(
-      "Step 1: Click 1-Click Deploy above. Once Cloudflare finishes building your Worker, click 'Visit' (or copy its https://dinkus-pi-durable-worker.<your-subdomain>.workers.dev URL) and paste ONLY that URL below — no token is required if you deployed with defaults.",
+      "Step 1: Click 1-Click Deploy above. Step 2: Open your Worker's 'Domains' tab in Cloudflare, switch 'Production *.workers.dev' ON, and paste that https://...workers.dev URL below (leave token blank).",
     ),
   );
 
