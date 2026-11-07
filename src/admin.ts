@@ -179,15 +179,34 @@ export function setupPage(
   collections: Array<{ slug: string; label: string }>,
   failure?: string,
 ): BlockResponse {
-  const blocks: Block[] = [
-    header("Pi Assistant (Pi Durable)"),
-    banner(
-      failure ? "error" : "default",
-      failure ? "Could not save Pi Durable connection" : "Bolt Pi Durable Next to Your EmDash Site",
-      failure ??
-        "Deploy the companion Cloudflare Worker + Durable Object (@earendil-works/pi-durable) in one click, connect your favorite Pi subscription, and collaborate across any EmDash CMS site.",
-    ),
-  ];
+  const blocks: Block[] = [header("Pi Assistant")];
+
+  if (failure) {
+    blocks.push(banner("error", "Could not save Pi Durable connection", failure));
+  }
+
+  blocks.push({
+    type: "stats",
+    items: [
+      {
+        label: "Connection Status",
+        value: "Awaiting Worker",
+        description: "Deploy companion Worker in 1 click",
+        trend: "neutral",
+      },
+      {
+        label: "Durable Runtime",
+        value: "Pi Durable + SQLite",
+        description: "@earendil-works/pi-durable on Cloudflare DO",
+      },
+      {
+        label: "Safety Posture",
+        value: "Approval Gated",
+        description: "WAITING_FOR_HUMAN cards before edits",
+        trend: "up",
+      },
+    ],
+  });
 
   if (!isAdmin) {
     blocks.push(
@@ -198,10 +217,14 @@ export function setupPage(
     return { blocks };
   }
 
-  blocks.push(
+  const leftColumn: Block[] = [
     {
-      type: "actions",
-      elements: [
+      type: "empty",
+      size: "base",
+      title: "Step 1 — Deploy Companion Worker",
+      description:
+        "Creates a private Git repo and deploys the serverless Pi Durable SQLite Durable Object to your Cloudflare account.",
+      actions: [
         {
           type: "link",
           label: "1-Click Deploy Pi Worker to Cloudflare",
@@ -210,66 +233,93 @@ export function setupPage(
         },
       ],
     },
-    fields(
-      ["1. Deploy Defaults", "Private Git repo (ON), Protect with Cloudflare Access (OFF), Root '/'"],
-      ["2. Enable Worker URL", "In Cloudflare Worker → Domains, toggle 'Production *.workers.dev' ON"],
-      ["3. Copy Worker URL", "Copy https://dinkus-pi-durable-worker.<your-subdomain>.workers.dev and paste below"],
-      ["4. Optional Token", "Leave token blank unless you added PI_WORKER_TOKEN in Cloudflare Environment Variables"],
-    ),
-    context(
-      "Step 1: Click 1-Click Deploy above. Step 2: Open your Worker's 'Domains' tab in Cloudflare, switch 'Production *.workers.dev' ON, and paste that https://...workers.dev URL below (leave token blank).",
-    ),
-  );
+    {
+      type: "table",
+      page_action_id: "setup_steps_noop",
+      columns: [
+        { key: "step", label: "Step", format: "badge" },
+        { key: "screen", label: "Cloudflare Screen" },
+        { key: "action", label: "What to Do", format: "code" },
+      ],
+      rows: [
+        {
+          step: "1. Deploy",
+          screen: "Set up application",
+          action: "Keep Access OFF, Root '/'",
+        },
+        {
+          step: "2. Enable URL",
+          screen: "Worker → Domains tab",
+          action: "Toggle Production *.workers.dev ON",
+        },
+        {
+          step: "3. Connect",
+          screen: "EmDash (right column)",
+          action: "Paste https://...workers.dev URL",
+        },
+      ],
+    },
+  ];
 
-  const collectionToggles: FormField[] = collections.map(col => ({
-    type: "toggle",
-    action_id: `col_${col.slug}`,
-    label: `Enable Editor Side-Panel on "${col.label}" (${col.slug})`,
-    initial_value: true,
-  }));
+  const rightColumn: Block[] = [
+    header("Step 2 — Connect Worker & Subscription"),
+    {
+      type: "form",
+      block_id: "pi-durable-connect-form",
+      fields: [
+        {
+          type: "text_input",
+          action_id: "workerUrl",
+          label: "Pi Durable Worker HTTPS URL",
+          placeholder: "https://dinkus-pi-durable-worker.your-subdomain.workers.dev",
+        },
+        {
+          type: "select",
+          action_id: "model",
+          label: "Pi Subscription Model",
+          initial_value: "openai-codex/gpt-6.1-sol:high",
+          options: Object.entries(SUPPORTED_PI_MODELS).map(([value, label]) => ({
+            value,
+            label,
+          })),
+        },
+        {
+          type: "select",
+          action_id: "authorityMode",
+          label: "Starting Authority Mode",
+          initial_value: "read_only",
+          options: [
+            { label: "Read-only (inspect & answer only)", value: "read_only" },
+            {
+              label: "Propose with WAITING_FOR_HUMAN approval cards",
+              value: "propose_with_approval",
+            },
+          ],
+        },
+        {
+          type: "checkbox",
+          action_id: "enabledCollections",
+          label: "Enable Editor Side-Panel on Collections",
+          initial_value: collections.map(col => col.slug),
+          options: collections.map(col => ({
+            label: `${col.label} (${col.slug})`,
+            value: col.slug,
+          })),
+        },
+        {
+          type: "secret_input",
+          action_id: "workerToken",
+          label: "Optional Worker Secret Token (leave blank for default deploy)",
+          placeholder: "Leave blank unless you set PI_WORKER_TOKEN in Cloudflare",
+        },
+      ],
+      submit: { label: "Save Pi Durable connection", action_id: "save_connection" },
+    },
+  ];
 
   blocks.push({
-    type: "form",
-    block_id: "pi-durable-connect-form",
-    fields: [
-      {
-        type: "text_input",
-        action_id: "workerUrl",
-        label: "Pi Durable Worker HTTPS URL (click 'Visit' on your Cloudflare build to copy)",
-        placeholder: "https://dinkus-pi-durable-worker.your-subdomain.workers.dev",
-      },
-      {
-        type: "select",
-        action_id: "model",
-        label: "Pi Subscription Model",
-        initial_value: "openai-codex/gpt-6.1-sol:high",
-        options: Object.entries(SUPPORTED_PI_MODELS).map(([value, label]) => ({
-          value,
-          label,
-        })),
-      },
-      {
-        type: "text_input",
-        action_id: "workerToken",
-        label: "Optional Worker Secret Token (leave blank if you deployed with defaults)",
-        placeholder: "Leave blank unless you set PI_WORKER_TOKEN in Cloudflare",
-      },
-      {
-        type: "select",
-        action_id: "authorityMode",
-        label: "Starting Authority Mode",
-        initial_value: "read_only",
-        options: [
-          { label: "Read-only (inspect & answer only)", value: "read_only" },
-          {
-            label: "Propose with WAITING_FOR_HUMAN approval cards",
-            value: "propose_with_approval",
-          },
-        ],
-      },
-      ...collectionToggles,
-    ],
-    submit: { label: "Save Pi Durable connection", action_id: "save_connection" },
+    type: "columns",
+    columns: [leftColumn, rightColumn],
   });
 
   return { blocks };
@@ -285,33 +335,63 @@ export function workspacePage(
   toast?: BlockResponse["toast"],
 ): BlockResponse {
   const modelLabel = SUPPORTED_PI_MODELS[connection.model] ?? connection.model;
-  const blocks: Block[] = [
-    header("Pi Assistant (Pi Durable)"),
-    fields(
-      ["Durable Object Worker", connection.workerUrl],
-      ["Pi Subscription Model", modelLabel],
-      [
-        "Enabled Content Panels",
-        connection.enabledCollections.length > 0
-          ? connection.enabledCollections.join(", ")
-          : "None (Sidebar only)",
-      ],
-      [
-        "Authority Posture",
-        connection.authorityMode === "read_only"
-          ? "Read-only (no site mutations)"
-          : "WAITING_FOR_HUMAN approval required before mutations",
-      ],
-    ),
-  ];
-
-  if (replyText) {
-    blocks.push(banner("default", `Pi Durable (${modelLabel})`, replyText));
+  let workerHost = connection.workerUrl;
+  try {
+    workerHost = new URL(connection.workerUrl).host;
+  } catch {
+    // Keep full string if URL parsing fails.
   }
 
+  const blocks: Block[] = [
+    header("Pi Assistant"),
+    {
+      type: "stats",
+      items: [
+        {
+          label: "Pi Subscription Model",
+          value: modelLabel.split("—")[1]?.trim() ?? modelLabel,
+          description: modelLabel.split("—")[0]?.trim() ?? connection.model,
+          trend: "up",
+        },
+        {
+          label: "Durable Object Worker",
+          value: workerHost,
+          description: activeTurn ? `Active task (${activeTurn.status})` : "Idle & ready",
+        },
+        {
+          label: "Approval Queue",
+          value: proposals.length,
+          description:
+            proposals.length === 0 ? "No pending mutations" : "Awaiting WAITING_FOR_HUMAN review",
+          trend: proposals.length > 0 ? "up" : "neutral",
+        },
+      ],
+    },
+  ];
+
+  const assistantLeft: Block[] = [
+    {
+      type: "form",
+      block_id: "pi-durable-prompt-form",
+      fields: [
+        {
+          type: "text_input",
+          action_id: "prompt",
+          label: "Ask your Pi Durable assistant",
+          placeholder: "Audit pages, draft a blog post, or inspect site content...",
+          multiline: true,
+        },
+      ],
+      submit: { label: "Send to Pi Durable", action_id: "ask_agent" },
+    },
+  ];
+
+  const assistantRight: Block[] = [];
+  if (replyText) {
+    assistantRight.push(banner("default", `Latest Activity (${modelLabel})`, replyText));
+  }
   if (activeTurn && activeTurn.status !== "completed") {
-    blocks.push(
-      header("Active Task — Live Steer"),
+    assistantRight.push(
       banner(
         "alert",
         `Pi Durable is working (${activeTurn.status})`,
@@ -324,7 +404,7 @@ export function workspacePage(
           {
             type: "text_input",
             action_id: "steerMessage",
-            label: "Steer Pi Durable mid-task (whenBusy: steer)",
+            label: "Live Steer (whenBusy: steer)",
             placeholder: "Adjust tone, narrow scope, or change target fields...",
           },
         ],
@@ -342,91 +422,131 @@ export function workspacePage(
         ],
       },
     );
+  } else if (!replyText) {
+    assistantRight.push({
+      type: "empty",
+      size: "sm",
+      title: "Ready for Instructions",
+      description:
+        "Send a prompt on the left or open any enabled collection entry to use the Pi Assistant side-panel.",
+    });
   }
 
-  blocks.push({
-    type: "form",
-    block_id: "pi-durable-prompt-form",
-    fields: [
-      {
-        type: "text_input",
-        action_id: "prompt",
-        label: "Ask your Pi Durable assistant",
-        placeholder: "Audit pages, draft a blog post, or inspect site content...",
-      },
-    ],
-    submit: { label: "Send to Pi Durable", action_id: "ask_agent" },
-  });
+  const approvalBlocks: Block[] =
+    proposals.length === 0
+      ? [
+          {
+            type: "empty",
+            size: "base",
+            title: "No Pending Approval Cards",
+            description:
+              "When Pi Assistant proposes content edits or site actions, WAITING_FOR_HUMAN cards appear here for one-click approval.",
+          },
+        ]
+      : proposals.flatMap(proposal => [
+          fields(
+            ["Proposal", proposal.summary],
+            ["Tool / Action", proposal.targetTool],
+            ["Model", SUPPORTED_PI_MODELS[proposal.model] ?? proposal.model],
+            ...(proposal.collection
+              ? [
+                  [
+                    "Target Entry",
+                    `${proposal.collection}/${proposal.entryId ?? ""}`,
+                  ] as [string, string],
+                ]
+              : []),
+          ),
+          {
+            type: "actions" as const,
+            elements: [
+              {
+                type: "button" as const,
+                label: "Approve action",
+                action_id: "approve_proposal",
+                value: proposal.proposalId,
+                style: "primary" as const,
+              },
+              {
+                type: "button" as const,
+                label: "Reject",
+                action_id: "reject_proposal",
+                value: proposal.proposalId,
+                style: "danger" as const,
+              },
+            ],
+          },
+          { type: "divider" as const },
+        ]);
 
-  if (proposals.length > 0) {
-    blocks.push(
-      header("Pending Approval Cards (WAITING_FOR_HUMAN)"),
-      banner(
-        "alert",
-        "Human approval required",
-        "Your Pi Durable assistant proposed the following content or site changes. Review each card before approving or rejecting.",
-      ),
-    );
-    for (const proposal of proposals) {
-      blocks.push(
-        fields(
-          ["Proposal", proposal.summary],
-          ["Tool / Action", proposal.targetTool],
-          ["Model", SUPPORTED_PI_MODELS[proposal.model] ?? proposal.model],
-          ...(proposal.collection
-            ? [["Target Entry", `${proposal.collection}/${proposal.entryId ?? ""}`] as [string, string]]
-            : []),
-        ),
+  const settingsBlocks: Block[] = isAdmin
+    ? [
         {
-          type: "actions",
-          elements: [
-            {
-              type: "button",
-              label: "Approve action",
-              action_id: "approve_proposal",
-              value: proposal.proposalId,
-              style: "primary",
-            },
-            {
-              type: "button",
-              label: "Reject",
-              action_id: "reject_proposal",
-              value: proposal.proposalId,
-              style: "danger",
-            },
+          type: "columns",
+          columns: [
+            [
+              {
+                type: "form",
+                block_id: "pi-durable-collections-form",
+                fields: [
+                  {
+                    type: "checkbox",
+                    action_id: "enabledCollections",
+                    label: "Enabled Editor Side-Panel Collections",
+                    initial_value: connection.enabledCollections,
+                    options: collections.map(col => ({
+                      label: `${col.label} (${col.slug})`,
+                      value: col.slug,
+                    })),
+                  },
+                ],
+                submit: { label: "Update enabled collections", action_id: "save_collections" },
+              },
+            ],
+            [
+              fields(
+                ["Worker Endpoint", connection.workerUrl],
+                [
+                  "Authority Mode",
+                  connection.authorityMode === "read_only"
+                    ? "Read-only"
+                    : "Propose with WAITING_FOR_HUMAN cards",
+                ],
+              ),
+              {
+                type: "actions",
+                elements: [
+                  {
+                    type: "button",
+                    label: "Disconnect Worker",
+                    action_id: "disconnect",
+                    style: "secondary",
+                  },
+                ],
+              },
+            ],
           ],
         },
-      );
-    }
-  }
+      ]
+    : [context("Only an Administrator can modify enabled collections or disconnect the Worker.")];
 
-  if (isAdmin && collections.length > 0) {
-    blocks.push(
-      header("Configure Content Editor Side-Panels"),
+  blocks.push({
+    type: "tab",
+    panels: [
       {
-        type: "form",
-        block_id: "pi-durable-collections-form",
-        fields: collections.map(col => ({
-          type: "toggle",
-          action_id: `col_${col.slug}`,
-          label: `${col.label} (${col.slug})`,
-          initial_value: connection.enabledCollections.includes(col.slug),
-        })),
-        submit: { label: "Update enabled collections", action_id: "save_collections" },
+        label: "Assistant & Live Steer",
+        blocks: [{ type: "columns", columns: [assistantLeft, assistantRight] }],
       },
       {
-        type: "actions",
-        elements: [
-          {
-            type: "button",
-            label: "Disconnect Worker",
-            action_id: "disconnect",
-            style: "secondary",
-          },
-        ],
+        label: `Approval Queue (${proposals.length})`,
+        blocks: approvalBlocks,
       },
-    );
-  }
+      {
+        label: "Collections & Connection",
+        blocks: settingsBlocks,
+      },
+    ],
+  });
 
   return { blocks, ...(toast ? { toast } : {}) };
 }
@@ -484,9 +604,9 @@ export async function piDurableAdmin(
       return setupPage(true, collections, "Pick a supported Pi subscription model.");
     }
 
-    const enabledCollections = collections
-      .filter(col => event.values[`col_${col.slug}`] !== false)
-      .map(col => col.slug);
+    const enabledCollections = Array.isArray(event.values.enabledCollections)
+      ? event.values.enabledCollections.filter((item): item is string => typeof item === "string")
+      : collections.filter(col => event.values[`col_${col.slug}`] !== false).map(col => col.slug);
 
     const nextConnection: PiDurableConnection = {
       workerUrl,
@@ -531,9 +651,9 @@ export async function piDurableAdmin(
   let activeTurn = await loadActiveTurn(ctx);
 
   if (event.type === "form_submit" && event.action_id === "save_collections" && isAdmin) {
-    const enabledCollections = collections
-      .filter(col => event.values[`col_${col.slug}`] === true)
-      .map(col => col.slug);
+    const enabledCollections = Array.isArray(event.values.enabledCollections)
+      ? event.values.enabledCollections.filter((item): item is string => typeof item === "string")
+      : collections.filter(col => event.values[`col_${col.slug}`] === true).map(col => col.slug);
     const updated: PiDurableConnection = { ...connection, enabledCollections };
     const existing = await ctx.settings.getVersioned("connection");
     await ctx.settings.compareAndSet(

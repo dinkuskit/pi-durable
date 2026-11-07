@@ -79,14 +79,18 @@ test("renders 1-Click Deploy to Cloudflare button and dynamic collection toggles
   });
   const initial = await admin(route({ type: "page_load" }), ctx);
   assert.doesNotThrow(() => validateBlockResponse(initial));
-  const actionsBlock = initial.blocks.find(b => b.type === "actions");
-  assert.ok(actionsBlock);
-  assert.equal(actionsBlock.elements[0].type, "link");
-  assert.equal(actionsBlock.elements[0].label, "1-Click Deploy Pi Worker to Cloudflare");
+  const colsBlock = initial.blocks.find(b => b.type === "columns");
+  assert.ok(colsBlock);
+  const emptyCard = colsBlock.columns[0].find(b => b.type === "empty");
+  assert.ok(emptyCard);
+  assert.equal(emptyCard.actions[0].type, "link");
+  assert.equal(emptyCard.actions[0].label, "1-Click Deploy Pi Worker to Cloudflare");
 
-  const form = initial.blocks.find(b => b.type === "form" && b.block_id === "pi-durable-connect-form");
+  const form = colsBlock.columns[1].find(b => b.type === "form" && b.block_id === "pi-durable-connect-form");
   assert.ok(form);
-  assert.equal(form.fields.some(f => f.action_id === "col_case_studies"), true);
+  const checkboxField = form.fields.find(f => f.action_id === "enabledCollections");
+  assert.ok(checkboxField);
+  assert.equal(checkboxField.options.some(o => o.value === "case_studies"), true);
 
   const connected = await admin(
     route({
@@ -95,10 +99,8 @@ test("renders 1-Click Deploy to Cloudflare button and dynamic collection toggles
       values: {
         workerUrl: "https://pi-durable-assistant.example.workers.dev",
         model: "openai-codex/gpt-6.1-sol:high",
-        workerToken: "pi_do_test_token_123",
         authorityMode: "propose_with_approval",
-        col_pages: true,
-        col_case_studies: false,
+        enabledCollections: ["pages"],
       },
     }),
     ctx,
@@ -128,8 +130,12 @@ test("supports live mid-task steer and configurable editor side-panel collaborat
     ctx,
   );
   assert.doesNotThrow(() => validateBlockResponse(started));
+  const tabBlock = started.blocks.find(b => b.type === "tab");
+  assert.ok(tabBlock);
+  const assistantCols = tabBlock.panels[0].blocks.find(b => b.type === "columns");
+  assert.ok(assistantCols);
   assert.equal(
-    started.blocks.some(b => b.type === "form" && b.block_id === "pi-durable-steer-form"),
+    assistantCols.columns[1].some(b => b.type === "form" && b.block_id === "pi-durable-steer-form"),
     true,
   );
 
