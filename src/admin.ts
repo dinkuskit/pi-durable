@@ -209,8 +209,14 @@ export function setupPage(
         },
       ],
     },
+    fields(
+      ["Repository Visibility", "Private Git repository (default)"],
+      ["Protect with Cloudflare Access", "Leave OFF (EmDash authenticates server-to-server via Bearer token)"],
+      ["Root Directory & API Token", "Leave as '/' and 'Create new token' (defaults)"],
+      ["Optional Environment Variable", "Add PI_WORKER_TOKEN under Environment Variables to require a custom secret"],
+    ),
     context(
-      "Step 1: Click above to deploy the companion Durable Object Worker to your Cloudflare account. Step 2: Paste your Worker URL and subscription token below.",
+      "Step 1: Click above and hit Deploy with the defaults above. Step 2: Paste your deployed *.workers.dev URL and token below.",
     ),
   );
 

@@ -17,6 +17,7 @@
     "build": "emdash-plugin validate && emdash-plugin build && node scripts/check-registry-bundle.mjs",
     "typecheck": "tsc --noEmit",
     "test": "npm run build && node --test tests/*.test.mjs",
+    "deploy": "npx wrangler deploy --config worker/wrangler.jsonc",
     "verify:quick": "bin/verify-pi-durable quick",
     "verify:full": "bin/verify-pi-durable full"
   },
