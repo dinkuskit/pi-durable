@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.tmp/
+.emdash-release/
+.artifacts/
+runs/
+worker/node_modules/
+worker/.wrangler/

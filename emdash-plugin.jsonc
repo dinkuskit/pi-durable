@@ -1,0 +1,44 @@
+{
+  "$schema": "./node_modules/@emdash-cms/plugin-cli/schemas/emdash-plugin.schema.json",
+  "slug": "dinkus-pi-durable",
+  "publisher": "did:plc:ekk4pjmkh3k3ql2kfoex3qt4",
+  "name": "Pi Durable",
+  "description": "Bolt a serverless Pi Durable agent (Cloudflare Worker + Durable Object) next to your EmDash site with BYO subscriptions.",
+  "license": "MIT",
+  "author": {
+    "name": "DinkusKit",
+    "url": "https://github.com/dinkuskit"
+  },
+  "security": {
+    "url": "https://github.com/dinkuskit/pi-durable/security"
+  },
+  "repo": "https://github.com/dinkuskit/pi-durable",
+  "capabilities": [
+    "network:request",
+    "schema:read",
+    "content:read",
+    "admin.editor-draft:read",
+    "admin.editor-draft:patch"
+  ],
+  "allowedHosts": [
+    "dinkuskit.com"
+  ],
+  "storage": {},
+  "admin": {
+    "settingsSchema": {
+      "connection": {
+        "type": "secret",
+        "label": "Pi Durable Worker connection",
+        "description": "Encrypted Pi Durable Worker URL, Pi provider/model selection, and bearer credentials. Managed on the Pi Assistant page; do not edit raw JSON here."
+      }
+    },
+    "pages": [
+      {
+        "path": "/pi-durable",
+        "label": "Pi Assistant",
+        "icon": "sparkles",
+        "group": "Dinkus Pi"
+      }
+    ]
+  }
+}
