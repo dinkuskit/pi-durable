@@ -136,14 +136,15 @@ async function loadConnection(ctx: PluginContext): Promise<PiDurableConnection |
       typeof parsed.workerUrl === "string" &&
       parsed.workerUrl.startsWith("https://") &&
       typeof parsed.model === "string" &&
-      parsed.model in SUPPORTED_PI_MODELS &&
-      typeof parsed.workerToken === "string" &&
-      parsed.workerToken.length > 0
+      parsed.model in SUPPORTED_PI_MODELS
     ) {
       return {
         workerUrl: parsed.workerUrl,
         model: parsed.model,
-        workerToken: parsed.workerToken,
+        workerToken:
+          typeof parsed.workerToken === "string" && parsed.workerToken.length > 0
+            ? parsed.workerToken
+            : "default",
         authorityMode:
           parsed.authorityMode === "propose_with_approval"
             ? "propose_with_approval"
@@ -216,7 +217,7 @@ export function setupPage(
       ["Optional Environment Variable", "Add PI_WORKER_TOKEN under Environment Variables to require a custom secret"],
     ),
     context(
-      "Step 1: Click above and hit Deploy with the defaults above. Step 2: Paste your deployed *.workers.dev URL and token below.",
+      "Step 1: Click 1-Click Deploy above. Once Cloudflare finishes building your Worker, click 'Visit' (or copy its https://dinkus-pi-durable-worker.<your-subdomain>.workers.dev URL) and paste ONLY that URL below — no token is required if you deployed with defaults.",
     ),
   );
 
@@ -234,8 +235,8 @@ export function setupPage(
       {
         type: "text_input",
         action_id: "workerUrl",
-        label: "Pi Durable Worker HTTPS URL",
-        placeholder: "https://pi-durable-assistant.your-subdomain.workers.dev",
+        label: "Pi Durable Worker HTTPS URL (click 'Visit' on your Cloudflare build to copy)",
+        placeholder: "https://dinkus-pi-durable-worker.your-subdomain.workers.dev",
       },
       {
         type: "select",
@@ -250,8 +251,8 @@ export function setupPage(
       {
         type: "text_input",
         action_id: "workerToken",
-        label: "Worker / Subscription Secret Token",
-        placeholder: "pi_do_live_...",
+        label: "Optional Worker Secret Token (leave blank if you deployed with defaults)",
+        placeholder: "Leave blank unless you set PI_WORKER_TOKEN in Cloudflare",
       },
       {
         type: "select",
@@ -470,7 +471,7 @@ export async function piDurableAdmin(
     }
     const workerUrl = cleanText(event.values.workerUrl, 300);
     const model = cleanText(event.values.model, 120);
-    const workerToken = cleanText(event.values.workerToken, 300);
+    const workerToken = cleanText(event.values.workerToken, 300) ?? "default";
     const authorityMode =
       event.values.authorityMode === "propose_with_approval"
         ? "propose_with_approval"
@@ -481,9 +482,6 @@ export async function piDurableAdmin(
     }
     if (!model || !(model in SUPPORTED_PI_MODELS)) {
       return setupPage(true, collections, "Pick a supported Pi subscription model.");
-    }
-    if (!workerToken) {
-      return setupPage(true, collections, "Enter your Pi Durable Worker / subscription token.");
     }
 
     const enabledCollections = collections
