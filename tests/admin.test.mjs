@@ -4,8 +4,17 @@ import plugin from "../dist/plugin.mjs";
 import { validateBlockResponse } from "@emdash-cms/blocks/server";
 
 const admin = plugin.routes.admin.handler;
+const editorPanel = plugin.routes["editor/assistant"].handler;
 
-function createHost({ role = 50, initialConnection = null, initialProposals = [] } = {}) {
+function createHost({
+  role = 50,
+  initialConnection = null,
+  initialProposals = [],
+  collections = [
+    { slug: "pages", label: "Pages" },
+    { slug: "posts", label: "Blog Posts" },
+  ],
+} = {}) {
   const stored = new Map();
   if (initialConnection) {
     stored.set("connection", { value: JSON.stringify(initialConnection), revision: "1" });
@@ -17,7 +26,10 @@ function createHost({ role = 50, initialConnection = null, initialProposals = []
   let revisions = 1;
   const ctx = {
     plugin: { id: "dinkus-pi-durable", version: "0.0.0" },
-    site: { url: "https://shop.example.test", name: "Shop", locale: "en" },
+    site: { url: "https://site.example.test", name: "Example Site", locale: "en" },
+    schema: {
+      listCollections: async () => collections,
+    },
     settings: {
       get: async name => stored.get(name)?.value ?? null,
       delete: async name => stored.delete(name),
@@ -40,11 +52,11 @@ function createHost({ role = 50, initialConnection = null, initialProposals = []
     },
     log: { error() {}, info() {}, warn() {}, debug() {} },
   };
-  const route = input => ({
+  const route = (input, entry = undefined) => ({
     input,
-    ui: { surface: "admin-page", locale: "en", direction: "ltr" },
+    ui: { surface: entry ? "editor-panel" : "admin-page", locale: "en", direction: "ltr", ...(entry ? { entry } : {}) },
     user: { id: "u1", email: "owner@example.test", name: "Owner", role, createdAt: "" },
-    request: { url: "https://shop.example.test/_emdash/api/plugins/dinkus-pi-durable/admin", method: "POST", headers: {} },
+    request: { url: "https://site.example.test/_emdash/api/plugins/dinkus-pi-durable/admin", method: "POST", headers: {} },
   });
   return { ctx, route, stored, kv };
 }
@@ -57,71 +69,85 @@ test("refuses callers below Editor role with valid Block Kit", async () => {
   assert.equal(response.blocks[1].title, "Permission denied");
 });
 
-test("renders Pi Durable setup form on unconfigured load and saves subscription model", async () => {
-  const { ctx, route } = createHost({ role: 50 });
+test("renders 1-Click Deploy to Cloudflare button and dynamic collection toggles on setup", async () => {
+  const { ctx, route } = createHost({
+    role: 50,
+    collections: [
+      { slug: "pages", label: "Pages" },
+      { slug: "case_studies", label: "Case Studies" },
+    ],
+  });
   const initial = await admin(route({ type: "page_load" }), ctx);
   assert.doesNotThrow(() => validateBlockResponse(initial));
-  assert.equal(
-    initial.blocks.some(b => b.type === "form" && b.block_id === "pi-durable-connect-form"),
-    true,
-  );
+  const actionsBlock = initial.blocks.find(b => b.type === "actions");
+  assert.ok(actionsBlock);
+  assert.equal(actionsBlock.elements[0].type, "link");
+  assert.equal(actionsBlock.elements[0].label, "1-Click Deploy Pi Worker to Cloudflare");
+
+  const form = initial.blocks.find(b => b.type === "form" && b.block_id === "pi-durable-connect-form");
+  assert.ok(form);
+  assert.equal(form.fields.some(f => f.action_id === "col_case_studies"), true);
 
   const connected = await admin(
     route({
       type: "form_submit",
       action_id: "save_connection",
       values: {
-        workerUrl: "https://dinkuskit.com/api/pi-durable",
+        workerUrl: "https://pi-durable-assistant.example.workers.dev",
         model: "openai-codex/gpt-6.1-sol:high",
         workerToken: "pi_do_test_token_123",
         authorityMode: "propose_with_approval",
+        col_pages: true,
+        col_case_studies: false,
       },
     }),
     ctx,
   );
   assert.doesNotThrow(() => validateBlockResponse(connected));
   assert.equal(connected.toast?.type, "success");
-  assert.equal(
-    connected.blocks.some(b => b.type === "form" && b.block_id === "pi-durable-prompt-form"),
-    true,
-  );
 });
 
-test("renders WAITING_FOR_HUMAN approval cards and resolves approval", async () => {
+test("supports live mid-task steer and configurable editor side-panel collaboration", async () => {
   const { ctx, route } = createHost({
     role: 50,
     initialConnection: {
-      workerUrl: "https://dinkuskit.com/api/pi-durable",
+      workerUrl: "https://pi-durable-assistant.example.workers.dev",
       model: "openai-codex/gpt-6.1-sol:high",
       workerToken: "pi_do_test_token_123",
       authorityMode: "propose_with_approval",
+      enabledCollections: ["pages"],
     },
-    initialProposals: [
-      {
-        proposalId: "prop_pi_1",
-        model: "openai-codex/gpt-6.1-sol:high",
-        summary: "Patch product SEO description draft",
-        targetTool: "admin.editor-draft:patch",
-        createdAt: "2026-11-07T15:00:00Z",
-      },
-    ],
   });
 
-  const page = await admin(route({ type: "page_load" }), ctx);
-  assert.doesNotThrow(() => validateBlockResponse(page));
-  assert.equal(
-    page.blocks.some(b => b.type === "header" && b.text.includes("WAITING_FOR_HUMAN")),
-    true,
-  );
-
-  const approved = await admin(
+  const started = await admin(
     route({
-      type: "block_action",
-      action_id: "approve_proposal",
-      value: "prop_pi_1",
+      type: "form_submit",
+      action_id: "ask_agent",
+      values: { prompt: "Summarize SEO gaps across landing pages" },
     }),
     ctx,
   );
-  assert.doesNotThrow(() => validateBlockResponse(approved));
-  assert.equal(approved.toast?.message, "Approved proposal prop_pi_1.");
+  assert.doesNotThrow(() => validateBlockResponse(started));
+  assert.equal(
+    started.blocks.some(b => b.type === "form" && b.block_id === "pi-durable-steer-form"),
+    true,
+  );
+
+  const steered = await admin(
+    route({
+      type: "form_submit",
+      action_id: "steer_agent",
+      values: { steerMessage: "Prioritize the About page" },
+    }),
+    ctx,
+  );
+  assert.doesNotThrow(() => validateBlockResponse(steered));
+  assert.equal(steered.toast?.type, "info");
+
+  const pagesPanel = await editorPanel(
+    route({ type: "panel_load" }, { collection: "pages", id: "about", locale: "en", version: 1 }),
+    ctx,
+  );
+  assert.doesNotThrow(() => validateBlockResponse(pagesPanel));
+  assert.equal(pagesPanel.blocks.some(b => b.type === "form" && b.block_id === "pi-durable-entry-form"), true);
 });

@@ -3,7 +3,7 @@
   "slug": "dinkus-pi-durable",
   "publisher": "did:plc:ekk4pjmkh3k3ql2kfoex3qt4",
   "name": "Pi Durable",
-  "description": "Bolt a serverless Pi Durable agent (Cloudflare Worker + Durable Object) next to your EmDash site with BYO subscriptions.",
+  "description": "Bolt a serverless Pi Durable agent (Cloudflare Worker + Durable Object) next to any EmDash site with BYO subscriptions.",
   "license": "MIT",
   "author": {
     "name": "DinkusKit",
@@ -14,14 +14,9 @@
   },
   "repo": "https://github.com/dinkuskit/pi-durable",
   "capabilities": [
-    "network:request",
+    "network:request:unrestricted",
     "schema:read",
-    "content:read",
-    "admin.editor-draft:read",
-    "admin.editor-draft:patch"
-  ],
-  "allowedHosts": [
-    "dinkuskit.com"
+    "content:read"
   ],
   "storage": {},
   "admin": {
@@ -29,7 +24,7 @@
       "connection": {
         "type": "secret",
         "label": "Pi Durable Worker connection",
-        "description": "Encrypted Pi Durable Worker URL, Pi provider/model selection, and bearer credentials. Managed on the Pi Assistant page; do not edit raw JSON here."
+        "description": "Encrypted Pi Durable Worker URL, Pi subscription model, bearer token, and enabled content collections. Managed on the Pi Assistant page."
       }
     },
     "pages": [
@@ -37,7 +32,14 @@
         "path": "/pi-durable",
         "label": "Pi Assistant",
         "icon": "sparkles",
-        "group": "Dinkus Pi"
+        "group": "Pi Durable"
+      }
+    ],
+    "editorPanels": [
+      {
+        "id": "pi-durable-assistant",
+        "title": "Pi Assistant",
+        "route": "editor/assistant"
       }
     ]
   }
