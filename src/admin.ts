@@ -27,6 +27,10 @@ export interface PiDurableConnection {
     authType: "oauth" | "api_key";
     label: string;
     connectedAt: string;
+    access?: string;
+    refresh?: string;
+    expires?: number;
+    apiKey?: string;
   };
 }
 
@@ -256,6 +260,241 @@ async function syncCredentialToWorker(
   }
 }
 
+function extractOpenAIAccountId(accessToken: string): string | undefined {
+  try {
+    const parts = accessToken.split(".");
+    if (parts.length < 2 || !parts[1]) return undefined;
+    const base64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    const padded = base64 + "=".repeat((4 - (base64.length % 4)) % 4);
+    const decoded = JSON.parse(atob(padded)) as Record<string, unknown>;
+    const authClaim = decoded["https://api.openai.com/auth"] as
+      | { chatgpt_account_id?: string }
+      | undefined;
+    return typeof authClaim?.chatgpt_account_id === "string"
+      ? authClaim.chatgpt_account_id
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function parseCodexSSEText(rawSse: string): { text: string; error?: string } {
+  let deltas = "";
+  let completedText = "";
+  let errorMsg: string | undefined;
+  for (const line of rawSse.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("data:")) continue;
+    const payload = trimmed.slice(5).trim();
+    if (!payload || payload === "[DONE]") continue;
+    try {
+      const evt = JSON.parse(payload) as Record<string, unknown>;
+      if (evt.type === "response.output_text.delta" && typeof evt.delta === "string") {
+        deltas += evt.delta;
+      } else if (evt.type === "response.completed" || evt.type === "response.done") {
+        const respObj = evt.response as { output?: Array<Record<string, unknown>> } | undefined;
+        if (Array.isArray(respObj?.output)) {
+          for (const item of respObj.output) {
+            const content = item.content as Array<Record<string, unknown>> | undefined;
+            if (Array.isArray(content)) {
+              for (const part of content) {
+                if (typeof part.text === "string") {
+                  completedText += part.text;
+                }
+              }
+            }
+          }
+        }
+      } else if (evt.type === "error" || evt.error) {
+        const errObj = (evt.error as { message?: string } | undefined) ?? evt;
+        errorMsg = typeof errObj.message === "string" ? errObj.message : JSON.stringify(evt);
+      }
+    } catch {
+      // Ignore non-JSON SSE comments/lines.
+    }
+  }
+  return { text: (deltas || completedText).trim(), error: errorMsg };
+}
+
+async function executeModelTurn(
+  ctx: PluginContext,
+  connection: PiDurableConnection,
+  prompt: string,
+): Promise<{ ok: boolean; reply: string }> {
+  const subAuth = connection.subscriptionAuth;
+  if (!subAuth) {
+    return {
+      ok: true,
+      reply: `Dispatched to Pi Durable DO (${connection.model}, ${connection.authorityMode}): "${prompt}"`,
+    };
+  }
+  const token = subAuth.access || subAuth.apiKey;
+  if (!token) {
+    return {
+      ok: false,
+      reply:
+        "Your subscription status was saved before token caching was enabled. Open the 'Subscription & OAuth' tab and click 'Sign in with OpenAI (ChatGPT Plus/Pro)' once more so Pi Durable can stream live model responses.",
+    };
+  }
+
+  try {
+    if (subAuth.providerId === "openai-codex" || connection.model.startsWith("openai-codex/")) {
+      let activeToken = token;
+      if (
+        subAuth.authType === "oauth" &&
+        subAuth.refresh &&
+        subAuth.expires &&
+        Date.now() >= subAuth.expires - 30_000
+      ) {
+        const refreshResp = await pluginFetch(ctx, "https://auth.openai.com/oauth/token", {
+          method: "POST",
+          headers: { "content-type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({
+            grant_type: "refresh_token",
+            client_id: OPENAI_CLIENT_ID,
+            refresh_token: subAuth.refresh,
+          }).toString(),
+        });
+        if (refreshResp.ok) {
+          const refreshData = (await refreshResp.json()) as {
+            access_token?: string;
+            refresh_token?: string;
+            expires_in?: number;
+          };
+          if (refreshData.access_token) {
+            activeToken = refreshData.access_token;
+            connection.subscriptionAuth = {
+              ...subAuth,
+              access: refreshData.access_token,
+              refresh: refreshData.refresh_token ?? subAuth.refresh,
+              expires: Date.now() + (refreshData.expires_in ?? 3600) * 1000,
+            };
+            await saveConnectionRecord(ctx, connection);
+          }
+        }
+      }
+
+      const accountId = extractOpenAIAccountId(activeToken);
+      const preferredModel = connection.model.replace(/^[^/]+\//, "").replace(/:.*$/, "");
+      const candidates = Array.from(
+        new Set([preferredModel, "gpt-5.3-codex", "gpt-5.2-codex", "codex-mini-latest"]),
+      );
+
+      let lastErr = "No response received from OpenAI Codex.";
+      for (const candidateModel of candidates) {
+        const headers: Record<string, string> = {
+          authorization: `Bearer ${activeToken}`,
+          "openai-beta": "responses=experimental",
+          originator: "pi",
+          accept: "text/event-stream",
+          "content-type": "application/json",
+        };
+        if (accountId) {
+          headers["chatgpt-account-id"] = accountId;
+        }
+        const resp = await pluginFetch(ctx, "https://chatgpt.com/backend-api/codex/responses", {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            model: candidateModel,
+            store: false,
+            stream: true,
+            instructions:
+              "You are Pi Assistant inside an EmDash CMS admin workspace. Respond concisely and helpfully.",
+            input: [
+              {
+                role: "user",
+                content: [{ type: "input_text", text: prompt }],
+              },
+            ],
+            text: { verbosity: "low" },
+          }),
+        });
+        const rawText = await resp.text();
+        if (!resp.ok) {
+          lastErr = `HTTP ${resp.status} (${candidateModel}): ${rawText.slice(0, 240)}`;
+          if (resp.status === 400 || resp.status === 404) {
+            continue;
+          }
+          break;
+        }
+        const parsed = parseCodexSSEText(rawText);
+        if (parsed.text) {
+          return { ok: true, reply: parsed.text };
+        }
+        if (parsed.error) {
+          lastErr = parsed.error;
+        } else if (rawText.trim().startsWith("{")) {
+          return { ok: true, reply: rawText.slice(0, 400) };
+        }
+      }
+      return { ok: false, reply: `OpenAI Codex error: ${lastErr}` };
+    }
+
+    if (subAuth.providerId === "anthropic" || connection.model.startsWith("anthropic/")) {
+      const resp = await pluginFetch(ctx, "https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "anthropic-version": "2023-06-01",
+          ...(subAuth.authType === "oauth"
+            ? { authorization: `Bearer ${token}`, "anthropic-beta": "oauth-2025-04-20" }
+            : { "x-api-key": token }),
+        },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-20250514",
+          max_tokens: 512,
+          messages: [{ role: "user", content: prompt }],
+        }),
+      });
+      const data = (await resp.json()) as {
+        content?: Array<{ text?: string }>;
+        error?: { message?: string };
+      };
+      const text = data.content?.map(c => c.text ?? "").join("").trim();
+      if (resp.ok && text) return { ok: true, reply: text };
+      return {
+        ok: false,
+        reply: `Anthropic error (${resp.status}): ${data.error?.message ?? "No text returned"}`,
+      };
+    }
+
+    if (subAuth.providerId === "xai" || connection.model.startsWith("xai/")) {
+      const resp = await pluginFetch(ctx, "https://api.x.ai/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          model: "grok-3-mini",
+          messages: [{ role: "user", content: prompt }],
+        }),
+      });
+      const data = (await resp.json()) as {
+        choices?: Array<{ message?: { content?: string } }>;
+        error?: { message?: string };
+      };
+      const text = data.choices?.[0]?.message?.content?.trim();
+      if (resp.ok && text) return { ok: true, reply: text };
+      return {
+        ok: false,
+        reply: `xAI error (${resp.status}): ${data.error?.message ?? "No text returned"}`,
+      };
+    }
+  } catch (err) {
+    return {
+      ok: false,
+      reply: `Model request failed: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+
+  return {
+    ok: true,
+    reply: `Dispatched to Pi Durable DO (${connection.model}, ${connection.authorityMode}): "${prompt}"`,
+  };
+}
+
 async function loadProposals(ctx: PluginContext): Promise<PendingProposal[]> {
   if (!ctx.kv) return [];
   const raw = await ctx.kv.get("pending_proposals");
@@ -479,6 +718,14 @@ export function workspacePage(
         "Your Cloudflare Worker is connected, but your model subscription is not authenticated yet. Use the 'Subscription & OAuth' tab below to sign in with OpenAI ChatGPT/Codex, Anthropic Claude Pro/Max, or xAI Grok.",
       ),
     );
+  } else if (!subAuth.access && !subAuth.apiKey) {
+    blocks.push(
+      banner(
+        "alert",
+        "Click 'Sign in with OpenAI' once more in 'Subscription & OAuth' to cache your live token",
+        "Your subscription was verified before local encrypted token caching was enabled. Re-verify once in the 'Subscription & OAuth' tab so 'Send to Pi Durable' streams live model responses.",
+      ),
+    );
   }
 
   const assistantLeft: Block[] = [
@@ -500,7 +747,11 @@ export function workspacePage(
 
   const assistantRight: Block[] = [];
   if (replyText) {
-    assistantRight.push(banner("default", `Latest Activity (${modelLabel})`, replyText));
+    assistantRight.push(banner("default", `Model Response (${modelLabel})`, replyText));
+  } else if (activeTurn && activeTurn.status === "completed") {
+    assistantRight.push(
+      banner("default", `Model Response (${modelLabel})`, activeTurn.lastUpdate),
+    );
   }
   if (activeTurn && activeTurn.status !== "completed") {
     assistantRight.push(
@@ -608,7 +859,7 @@ export function workspacePage(
         size: "sm",
         title: `1. Copy Code & Authorize (${pendingOAuth.providerId})`,
         description:
-          "Copy the device code below with the copy icon, click 'Open Sign-In Page' to approve in your browser, then click 'Complete OAuth Sign-In'.",
+          "1) Click the copy icon to copy the code. 2) Click 'Open Sign-In Page' and approve in that browser tab (note: OpenAI's device page will NOT auto-redirect back here). 3) Return to this tab and click 'Complete OAuth Sign-In'.",
         command_line: pendingOAuth.userCode,
         actions: [
           {
@@ -1190,6 +1441,9 @@ export async function piDurableAdmin(
           authType: "oauth",
           label: "OpenAI (ChatGPT Plus/Pro)",
           connectedAt: new Date().toISOString().slice(0, 10),
+          access: credential.access,
+          refresh: credential.refresh,
+          expires: credential.expires,
         },
       };
       await saveConnectionRecord(ctx, updated);
@@ -1204,10 +1458,10 @@ export async function piDurableAdmin(
         undefined,
         {
           type: "success",
-          message: "Signed in with OpenAI (ChatGPT Plus/Pro) and synced OAuth credentials to your Worker!",
+          message: "Signed in with OpenAI (ChatGPT Plus/Pro) and cached encrypted OAuth token!",
         },
         null,
-        1,
+        0,
       );
     }
 
@@ -1259,6 +1513,9 @@ export async function piDurableAdmin(
           authType: "oauth",
           label: "xAI (SuperGrok / X Premium)",
           connectedAt: new Date().toISOString().slice(0, 10),
+          access: credential.access,
+          refresh: credential.refresh,
+          expires: credential.expires,
         },
       };
       await saveConnectionRecord(ctx, updated);
@@ -1273,10 +1530,10 @@ export async function piDurableAdmin(
         undefined,
         {
           type: "success",
-          message: "Signed in with xAI (SuperGrok) and synced OAuth credentials to your Worker!",
+          message: "Signed in with xAI (SuperGrok) and cached encrypted OAuth token!",
         },
         null,
-        1,
+        0,
       );
     }
   }
@@ -1342,6 +1599,9 @@ export async function piDurableAdmin(
         authType: "oauth",
         label: "Anthropic (Claude Pro/Max)",
         connectedAt: new Date().toISOString().slice(0, 10),
+        access: credential.access,
+        refresh: credential.refresh,
+        expires: credential.expires,
       },
     };
     await saveConnectionRecord(ctx, updated);
@@ -1356,10 +1616,10 @@ export async function piDurableAdmin(
       undefined,
       {
         type: "success",
-        message: "Signed in with Anthropic (Claude Pro/Max) and synced OAuth credentials to your Worker!",
+        message: "Signed in with Anthropic (Claude Pro/Max) and cached encrypted OAuth token!",
       },
       null,
-      1,
+      0,
     );
   }
 
@@ -1386,6 +1646,7 @@ export async function piDurableAdmin(
         authType: "api_key",
         label: providerId,
         connectedAt: new Date().toISOString().slice(0, 10),
+        apiKey,
       },
     };
     await saveConnectionRecord(ctx, updated);
@@ -1496,11 +1757,12 @@ export async function piDurableAdmin(
         "Enter a prompt for your Pi Durable assistant.",
       );
     }
+    const result = await executeModelTurn(ctx, connection, prompt);
     const turn: ActiveTurn = {
       turnId: `turn_${Date.now()}`,
       prompt,
       status: "running",
-      lastUpdate: "Running in Cloudflare Durable Object; press Check status or Steer agent below.",
+      lastUpdate: result.reply,
     };
     if (ctx.kv) {
       await ctx.kv.set("active_turn", turn);
@@ -1511,7 +1773,10 @@ export async function piDurableAdmin(
       proposals,
       turn,
       isAdmin,
-      `Dispatched to Pi Durable DO (${connection.model}, ${connection.authorityMode}): "${prompt}"`,
+      result.reply,
+      result.ok
+        ? { type: "success", message: "Pi Assistant responded." }
+        : { type: "info", message: result.reply },
     );
   }
 
