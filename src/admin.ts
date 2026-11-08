@@ -35,7 +35,7 @@ export interface PiDurableConnection {
 }
 
 export interface PendingOAuthSession {
-  providerId: "openai-codex" | "anthropic" | "xai";
+  providerId: "openai-codex" | "anthropic" | "xai" | "meta";
   flow: "device_code" | "pkce_code";
   userCode?: string;
   verificationUri: string;
@@ -99,11 +99,12 @@ function parseInteraction(input: unknown): Interaction | null {
 }
 
 function cleanText(value: unknown, max = 500): string | undefined {
-  return typeof value === "string" &&
-    value.trim().length > 0 &&
-    value.trim().length <= max &&
-    !/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(value)
-    ? value.trim()
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.replace(/\r\n?/g, "\n").trim();
+  return trimmed.length > 0 &&
+    trimmed.length <= max &&
+    !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/.test(trimmed)
+    ? trimmed
     : undefined;
 }
 
@@ -207,6 +208,7 @@ async function loadPendingOAuth(ctx: PluginContext): Promise<PendingOAuthSession
 const OPENAI_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const ANTHROPIC_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const XAI_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828";
+const MUSE_CLIENT_ID = "1031625952748946";
 
 function base64urlEncode(bytes: Uint8Array): string {
   let binary = "";
@@ -320,6 +322,7 @@ async function executeModelTurn(
   ctx: PluginContext,
   connection: PiDurableConnection,
   prompt: string,
+  collections: Array<{ slug: string; label: string }> = [],
 ): Promise<{ ok: boolean; reply: string }> {
   const subAuth = connection.subscriptionAuth;
   if (!subAuth) {
@@ -336,6 +339,12 @@ async function executeModelTurn(
         "Your subscription status was saved before token caching was enabled. Open the 'Subscription & OAuth' tab and click 'Sign in with OpenAI (ChatGPT Plus/Pro)' once more so Pi Durable can stream live model responses.",
     };
   }
+
+  const collectionSummary =
+    collections.length > 0
+      ? collections.map(c => `${c.label} (slug: ${c.slug})`).join(", ")
+      : connection.enabledCollections.join(", ");
+  const systemInstructions = `You are Pi Assistant inside an EmDash CMS store admin workspace. Active site collections: ${collectionSummary}. Enabled side-panel collections: ${connection.enabledCollections.join(", ")}. Authority mode: ${connection.authorityMode}. Respond concisely and helpfully.`;
 
   try {
     if (subAuth.providerId === "openai-codex" || connection.model.startsWith("openai-codex/")) {
@@ -399,8 +408,7 @@ async function executeModelTurn(
             model: candidateModel,
             store: false,
             stream: true,
-            instructions:
-              "You are Pi Assistant inside an EmDash CMS admin workspace. Respond concisely and helpfully.",
+            instructions: systemInstructions,
             input: [
               {
                 role: "user",
@@ -736,9 +744,8 @@ export function workspacePage(
         {
           type: "text_input",
           action_id: "prompt",
-          label: "Ask your Pi Durable assistant",
-          placeholder: "Audit pages, draft a blog post, or inspect site content...",
-          multiline: true,
+          label: "Message Pi Assistant (press Enter or click Send)",
+          placeholder: "Can you see my product collection? Draft a headline...",
         },
       ],
       submit: { label: "Send to Pi Durable", action_id: "ask_agent" },
@@ -945,6 +952,12 @@ export function workspacePage(
             type: "button",
             label: "Sign in with xAI (SuperGrok)",
             action_id: "start_oauth_xai",
+            style: "secondary",
+          },
+          {
+            type: "button",
+            label: "Sign in with Meta Muse",
+            action_id: "start_oauth_muse",
             style: "secondary",
           },
         ],
@@ -1315,6 +1328,73 @@ export async function piDurableAdmin(
     }
   }
 
+  if (event.type === "block_action" && event.action_id === "start_oauth_muse" && isAdmin) {
+    try {
+      const resp = await pluginFetch(ctx, "https://auth.meta.com/oidc/device/authorization/", {
+        method: "POST",
+        headers: {
+          accept: "application/json",
+          "content-type": "application/x-www-form-urlencoded",
+        },
+        body: new URLSearchParams({
+          client_id: MUSE_CLIENT_ID,
+        }).toString(),
+      });
+      const json = (await resp.json()) as {
+        device_code?: string;
+        user_code?: string;
+        verification_uri?: string;
+        verification_uri_complete?: string;
+        interval?: number;
+      };
+      if (!resp.ok || !json.device_code || !json.user_code) {
+        throw new Error(`Meta Muse device code request returned HTTP ${resp.status}`);
+      }
+      const nextOAuth: PendingOAuthSession = {
+        providerId: "meta",
+        flow: "device_code",
+        userCode: json.user_code,
+        verificationUri:
+          json.verification_uri_complete ?? json.verification_uri ?? "https://auth.meta.com",
+        deviceCode: json.device_code,
+        intervalSeconds: json.interval ?? 5,
+        createdAt: new Date().toISOString(),
+      };
+      if (ctx.kv) {
+        await ctx.kv.set("pending_oauth", nextOAuth);
+      }
+      return workspacePage(
+        connection,
+        collections,
+        proposals,
+        activeTurn,
+        isAdmin,
+        undefined,
+        {
+          type: "info",
+          message: `Meta Muse code ready (${json.user_code}). Copy the code and authorize in your browser.`,
+        },
+        nextOAuth,
+        1,
+      );
+    } catch (err) {
+      return workspacePage(
+        connection,
+        collections,
+        proposals,
+        activeTurn,
+        isAdmin,
+        undefined,
+        {
+          type: "error",
+          message: `Could not start Meta Muse device flow: ${err instanceof Error ? err.message : String(err)}`,
+        },
+        pendingOAuth,
+        1,
+      );
+    }
+  }
+
   if (event.type === "block_action" && event.action_id === "start_oauth_anthropic" && isAdmin) {
     const { verifier, challenge } = await generatePKCE();
     const authParams = new URLSearchParams({
@@ -1531,6 +1611,78 @@ export async function piDurableAdmin(
         {
           type: "success",
           message: "Signed in with xAI (SuperGrok) and cached encrypted OAuth token!",
+        },
+        null,
+        0,
+      );
+    }
+
+    if (pendingOAuth.providerId === "meta") {
+      const tokenResp = await pluginFetch(ctx, "https://auth.meta.com/oidc/device/token/", {
+        method: "POST",
+        headers: {
+          accept: "application/json",
+          "content-type": "application/x-www-form-urlencoded",
+        },
+        body: new URLSearchParams({
+          grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+          client_id: MUSE_CLIENT_ID,
+          device_code: pendingOAuth.deviceCode ?? "",
+        }).toString(),
+      });
+      if (!tokenResp.ok) {
+        return workspacePage(
+          connection,
+          collections,
+          proposals,
+          activeTurn,
+          isAdmin,
+          undefined,
+          {
+            type: "info",
+            message:
+              "Still waiting for Meta Muse browser approval — approve in your browser, then click 'Complete OAuth Sign-In' again.",
+          },
+          pendingOAuth,
+          1,
+        );
+      }
+      const tokenData = (await tokenResp.json()) as {
+        access_token?: string;
+        refresh_token?: string;
+        expires_in?: number;
+      };
+      const credential = {
+        type: "oauth",
+        access: tokenData.access_token ?? "",
+        refresh: tokenData.refresh_token ?? "",
+        expires: Date.now() + (tokenData.expires_in ?? 3600) * 1000,
+      };
+      const updated: PiDurableConnection = {
+        ...connection,
+        subscriptionAuth: {
+          providerId: "meta",
+          authType: "oauth",
+          label: "Meta (Muse Account)",
+          connectedAt: new Date().toISOString().slice(0, 10),
+          access: credential.access,
+          refresh: credential.refresh,
+          expires: credential.expires,
+        },
+      };
+      await saveConnectionRecord(ctx, updated);
+      await syncCredentialToWorker(ctx, updated, "meta", "oauth", credential);
+      if (ctx.kv) await ctx.kv.delete("pending_oauth");
+      return workspacePage(
+        updated,
+        collections,
+        proposals,
+        activeTurn,
+        isAdmin,
+        undefined,
+        {
+          type: "success",
+          message: "Signed in with Meta Muse and cached encrypted OAuth token!",
         },
         null,
         0,
@@ -1757,7 +1909,7 @@ export async function piDurableAdmin(
         "Enter a prompt for your Pi Durable assistant.",
       );
     }
-    const result = await executeModelTurn(ctx, connection, prompt);
+    const result = await executeModelTurn(ctx, connection, prompt, collections);
     const turn: ActiveTurn = {
       turnId: `turn_${Date.now()}`,
       prompt,
